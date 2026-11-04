@@ -1,0 +1,952 @@
+# =====================================================================
+#  Ulanzi TC001 Pixel Clock als Fronius-Solaranzeige (ESPHome)
+#  -------------------------------------------------------------------
+#  - 5 Modi mit automatischer Rotation: Netz / Verbrauch / PV /
+#    Batterie / Uhr (Uhr optional abschaltbar)
+#  - Fronius SolarAPI (GetPowerFlowRealtimeData.fcgi)
+#  - ALLES EINSTELLBAR IN DER WEB-UI:
+#      * Fronius IP (Standard)  - wird immer zuerst abgefragt
+#      * Fronius IP (Fallback)  - nur bei Verbindungsfehlern der Standard-IP
+#      * Abfrageintervall       - 3-60 s (Standard 5 s)
+#      * Wechselrichter-Nr.     - fuer den Batterie-SOC (Standard 1)
+#  - Automatische Helligkeit ueber den Helligkeitssensor (LDR)
+#  - IP-Laufschrift einmalig nach dem ersten WLAN-Verbindungsaufbau
+#  - 4 Schriftstile (2 TTF-Fonts, 2 handgezeichnete Pixel-Fonts)
+#  - Web-UI mit gruppierten Einstellungen (Web-Server v3)
+#  -------------------------------------------------------------------
+#  Getestet mit ESPHome 2026.10  |  Lizenz: MIT
+# =====================================================================
+
+# Alle persoenlichen Werte stehen hier gebuendelt als Platzhalter.
+# Hinweis: Enthaelt das WLAN-Passwort ein "$", als "$$" schreiben!
+substitutions:
+  name: "ulanzi-fronius"
+  friendly_name: "Ulanzi Fronius Display"
+  # ======= NUR FÜR DIE EIGENE KOPIE: HIER ANPASSEN ===================
+  # Hinweis: Enthaelt das WLAN-Passwort ein "$", als "$$" schreiben.
+  wifi_ssid: "DEIN-WLAN-NAME"
+  wifi_password: "DEIN-WLAN-PASSWORT"
+  ap_password: "12345678"        # Passwort des Setup-Hotspots
+  fronius_ip: "192.168.1.5"      # Vorgabe fuer das Feld "Fronius IP (Standard)"
+  latitude: "52.5208"            # Breitengrad (fuer Sonnenstand)
+  longitude: "13.4049"           # Laengengrad
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          id(auto_rotate) = true;
+          id(auto_brightness) = true;
+          // Aktive Fronius-IP aus dem Standard-Feld initialisieren
+          if (!id(fronius_std_text).state.empty())
+            id(fronius_active_ip) = id(fronius_std_text).state;
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+wifi:
+  # Zweites WLAN? Siehe README ("Anpassen").
+  networks:
+    - ssid: "${wifi_ssid}"
+      password: "${wifi_password}"
+  power_save_mode: none
+  ap:
+    ssid: "Ulanzi-Fronius-Setup"
+    password: "${ap_password}"
+
+captive_portal:
+
+ota:
+  - platform: esphome
+
+web_server:
+  port: 80
+  version: 3
+  sorting_groups:
+    - id: group_anzeige
+      name: "Anzeige"
+      sorting_weight: 10
+    - id: group_werte
+      name: "Fronius Werte"
+      sorting_weight: 20
+    - id: group_diag
+      name: "Diagnose"
+      sorting_weight: 30
+
+http_request:
+  timeout: 4s
+  verify_ssl: false
+
+json:
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Vienna
+
+sun:
+  id: my_sun
+  latitude: ${latitude}    # <-- Breite anpassen
+  longitude: ${longitude} # <-- Laenge anpassen
+
+font:
+  - file: "gfonts://Silkscreen"
+    id: pixel_font
+    size: 8
+  - file: "gfonts://Roboto Mono"
+    id: pixel_font_rm11
+    size: 11
+
+globals:
+  - id: grid_power
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: load_power
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: pv_power
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: battery_soc
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: data_valid
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: display_mode
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: auto_rotate
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+  - id: auto_brightness
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+  - id: rotate_counter
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: failed_attempts
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: brightness_level
+    type: float
+    restore_value: no
+    initial_value: '1.0'
+  # 0=Silkscreen | 1=Matrix 8 hoch | 2=Roboto Mono | 3=Matrix 7 hoch
+  - id: font_style
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  # Uhr sichtbar schalten (ueberlebt Neustart)
+  - id: show_clock
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+  # --- IP-Laufschrift ---
+  - id: ip_shown
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ip_text
+    type: std::string
+    restore_value: no
+    initial_value: ''
+  - id: ip_show_start
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: ip_show_ms
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: ip_step_ms
+    type: int
+    restore_value: no
+    initial_value: '250'
+  # --- Sekunden-Zaehler fuer das einstellbare Abfrageintervall ---
+  - id: poll_counter
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # --- aktuell aktive Fronius-IP (Startwert = Vorgabe aus ${fronius_ip}) ---
+  - id: fronius_active_ip
+    type: std::string
+    restore_value: no
+    initial_value: '"${fronius_ip}"'
+
+sensor:
+  - platform: adc
+    pin: GPIO35
+    id: ambient_light
+    name: "Umgebungslicht"
+    attenuation: auto
+    update_interval: 1s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_first_at: 1
+    web_server:
+      sorting_group_id: group_diag
+      sorting_weight: 10
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(auto_brightness);'
+            then:
+              - lambda: |-
+                  float v = id(ambient_light).state;
+                  float dark = id(ldr_dark).state;
+                  float bright = id(ldr_bright).state;
+                  if (bright <= dark) return;
+                  float b = (v - dark) / (bright - dark);
+                  if (b < 0.05f) b = 0.05f;
+                  if (b > 1.0f) b = 1.0f;
+                  float lvl = id(brightness_level);
+                  if (fabs(b - lvl) < 0.02f) return;
+                  id(brightness_level) = lvl + (b - lvl) * 0.30f;
+
+  - platform: template
+    name: "PV-Erzeugung"
+    id: pv_sensor
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: 'return id(pv_power);'
+    web_server:
+      sorting_group_id: group_werte
+      sorting_weight: 10
+
+  - platform: template
+    name: "Netzbezug und Einspeisung"
+    id: grid_sensor
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: 'return id(grid_power);'
+    web_server:
+      sorting_group_id: group_werte
+      sorting_weight: 20
+
+  - platform: template
+    name: "Hausverbrauch"
+    id: load_sensor
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: 'return id(load_power);'
+    web_server:
+      sorting_group_id: group_werte
+      sorting_weight: 30
+
+  - platform: template
+    name: "Batterieladung"
+    id: battery_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: 'return id(battery_soc);'
+    web_server:
+      sorting_group_id: group_werte
+      sorting_weight: 40
+
+text:
+  # Standard-IP des Wechselrichters - immer zuerst abgefragt,
+  # im Web-GUI aenderbar (ohne YAML-Edit).
+  - platform: template
+    name: "Fronius IP (Standard)"
+    id: fronius_std_text
+    mode: text
+    min_length: 7
+    max_length: 15
+    initial_value: "${fronius_ip}"
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_werte
+      sorting_weight: 45
+    on_value:
+      then:
+        - lambda: |-
+            // Aenderung wird sofort uebernommen, danach gleich wieder abfragen
+            id(fronius_active_ip) = id(fronius_std_text).state;
+            id(poll_counter) = 1000;
+
+  # Fallback: wird nur benutzt, wenn die Standard-IP NICHT ERREICHBAR
+  # ist (Verbindungsfehler). Klappt die aktive IP wieder, wird
+  # automatisch zurueckgeschaltet.
+  - platform: template
+    name: "Fronius IP (Fallback)"
+    id: fronius_ip_text
+    mode: text
+    min_length: 7
+    max_length: 15
+    initial_value: "${fronius_ip}"
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_werte
+      sorting_weight: 50
+
+text_sensor:
+  # IP-Adresse des Ulanzi (wifi_info) - Framework-unabhaengig,
+  # zeigt die IP dauerhaft in der Web-UI an.
+  - platform: wifi_info
+    ip_address:
+      name: "IP-Adresse"
+      id: wifi_ip_sensor
+      web_server:
+        sorting_group_id: group_diag
+        sorting_weight: 20
+
+  # zeigt an, welche Fronius-IP gerade aktiv abgefragt wird
+  - platform: template
+    name: "Aktive Fronius IP"
+    id: active_fronius_ip_sensor
+    update_interval: 5s
+    lambda: 'return id(fronius_active_ip);'
+    web_server:
+      sorting_group_id: group_diag
+      sorting_weight: 40
+
+number:
+  - platform: template
+    name: "Rotationsintervall"
+    id: rotate_interval_number
+    min_value: 2
+    max_value: 60
+    step: 1
+    initial_value: 4
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_anzeige
+      sorting_weight: 30
+    on_value:
+      then:
+        - lambda: 'id(rotate_counter) = 0;'
+
+  - platform: template
+    name: "Manuelle Helligkeit"
+    id: manual_brightness_number
+    min_value: 0.05
+    max_value: 1.0
+    step: 0.05
+    initial_value: 0.5
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_anzeige
+      sorting_weight: 50
+
+  - platform: template
+    name: "Lichtwert dunkel (V)"
+    id: ldr_dark
+    min_value: 0.0
+    max_value: 2.0
+    step: 0.05
+    initial_value: 0.1
+    unit_of_measurement: "V"
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_anzeige
+      sorting_weight: 60
+
+  - platform: template
+    name: "Lichtwert hell (V)"
+    id: ldr_bright
+    min_value: 0.5
+    max_value: 3.1
+    step: 0.05
+    initial_value: 2.5
+    unit_of_measurement: "V"
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_anzeige
+      sorting_weight: 70
+
+  # Vertikale Position: fuer TTF-Stile frei, fuer Matrix-7: <=4 Luft unten, >4 Luft oben
+  - platform: template
+    name: "Text-Position Y"
+    id: text_y_number
+    min_value: 0
+    max_value: 7
+    step: 1
+    initial_value: 2
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_anzeige
+      sorting_weight: 90
+
+  # Wie oft der Fronius abgefragt wird (Web-GUI-Regler)
+  - platform: template
+    name: "Abfrageintervall"
+    id: poll_interval_number
+    min_value: 3
+    max_value: 60
+    step: 1
+    initial_value: 5
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_werte
+      sorting_weight: 60
+    on_value:
+      then:
+        - lambda: 'id(poll_counter) = 0;'
+
+  # Nummer des Wechselrichters in der Fronius-API (fuer Batterie-SOC)
+  - platform: template
+    name: "Wechselrichter-Nr."
+    id: inverter_id_number
+    min_value: 0
+    max_value: 9
+    step: 1
+    initial_value: 1
+    optimistic: true
+    restore_value: true
+    web_server:
+      sorting_group_id: group_werte
+      sorting_weight: 65
+
+switch:
+  - platform: template
+    name: "Auto-Rotation"
+    id: auto_rotate_switch
+    lambda: 'return id(auto_rotate);'
+    turn_on_action:
+      - lambda: 'id(auto_rotate) = true;'
+    turn_off_action:
+      - lambda: 'id(auto_rotate) = false;'
+    web_server:
+      sorting_group_id: group_anzeige
+      sorting_weight: 20
+
+  - platform: template
+    name: "Auto-Helligkeit"
+    id: auto_brightness_switch
+    lambda: 'return id(auto_brightness);'
+    turn_on_action:
+      - lambda: 'id(auto_brightness) = true;'
+    turn_off_action:
+      - lambda: 'id(auto_brightness) = false;'
+    web_server:
+      sorting_group_id: group_anzeige
+      sorting_weight: 40
+
+  # Uhr in der Anzeige sichtbar schalten (ueberlebt Neustart).
+  # AUS = Uhr wird in Rotation, Tasten und Dropdown uebersprungen.
+  - platform: template
+    name: "Uhr anzeigen"
+    id: show_clock_switch
+    lambda: 'return id(show_clock);'
+    turn_on_action:
+      - lambda: 'id(show_clock) = true;'
+    turn_off_action:
+      - lambda: |-
+          id(show_clock) = false;
+          if (id(display_mode) == 4) id(display_mode) = 0;
+    web_server:
+      sorting_group_id: group_anzeige
+      sorting_weight: 15
+
+  - platform: gpio
+    pin:
+      number: GPIO15
+      ignore_strapping_warning: true
+    name: "Buzzer"
+    id: buzzer
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+  # startet die IP-Laufschrift manuell (und wird beim Boot automatisch
+  # vom 1s-Intervall ausgeloest, sobald WLAN + IP da sind)
+  - platform: template
+    name: "IP-Laufschrift starten"
+    id: ip_show_switch
+    lambda: 'return false;'
+    turn_on_action:
+      - lambda: |-
+          if (!id(wifi_ip_sensor).has_state() || id(wifi_ip_sensor).state.empty()) return;
+          id(ip_text) = id(wifi_ip_sensor).state;
+          int x1, y1, tw, th;
+          id(ulanzi_matrix).get_text_bounds(0, 0, id(ip_text).c_str(), id(pixel_font), TextAlign::TOP_LEFT, &x1, &y1, &tw, &th);
+          if (tw <= 0) tw = ((int) id(ip_text).size()) * 5;
+          int travel = 32 + tw;          // Weg: von rechts rein bis links raus
+          int step = 20000 / travel;     // so dauert ein Durchlauf ~20 Sekunden
+          if (step < 80) step = 80;
+          if (step > 350) step = 350;
+          id(ip_step_ms) = step;
+          id(ip_show_ms) = travel * step;
+          id(ip_show_start) = millis();
+          id(ip_shown) = true;
+    web_server:
+      sorting_group_id: group_diag
+      sorting_weight: 30
+
+select:
+  - platform: template
+    name: "Anzeigemodus"
+    id: mode_select
+    options:
+      - "Netz"
+      - "Verbrauch"
+      - "PV"
+      - "Batterie"
+      - "Uhr"
+    initial_option: "Netz"
+    optimistic: true
+    web_server:
+      sorting_group_id: group_anzeige
+      sorting_weight: 10
+    set_action:
+      - lambda: |-
+          id(auto_rotate) = false;
+          if (x == "Netz") id(display_mode) = 0;
+          else if (x == "Verbrauch") id(display_mode) = 1;
+          else if (x == "PV") id(display_mode) = 2;
+          else if (x == "Batterie") id(display_mode) = 3;
+          else if (x == "Uhr" && id(show_clock)) id(display_mode) = 4;
+      - component.update: ulanzi_matrix
+
+  - platform: template
+    name: "Schriftstil"
+    id: font_select
+    options:
+      - "Klein (Pixel)"       # 0: Silkscreen 8 (TTF)
+      - "Groß (Matrix)"       # 1: handgezeichneter 5x8-Font, volle Hoehe
+      - "Groß (Klar)"         # 2: Roboto Mono 11 (TTF)
+      - "Matrix (7 hoch)"     # 3: klassischer 5x7-Font mit einer Reihe Luft
+    initial_option: "Klein (Pixel)"
+    optimistic: true
+    web_server:
+      sorting_group_id: group_anzeige
+      sorting_weight: 80
+    set_action:
+      - lambda: |-
+          if (x == "Klein (Pixel)") id(font_style) = 0;
+          else if (x == "Groß (Matrix)") id(font_style) = 1;
+          else if (x == "Groß (Klar)") id(font_style) = 2;
+          else if (x == "Matrix (7 hoch)") id(font_style) = 3;
+      - component.update: ulanzi_matrix
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO26
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Taste Links"
+    internal: true
+    on_press:
+      then:
+        - lambda: |-
+            id(auto_rotate) = false;
+            int start = id(display_mode);
+            int new_mode = start;
+            do {
+              new_mode = (new_mode + 4) % 5;
+            } while (new_mode != start && new_mode == 4 && !id(show_clock));
+            id(display_mode) = new_mode;
+        - component.update: ulanzi_matrix
+
+  - platform: gpio
+    pin:
+      number: GPIO27
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Taste Mitte"
+    internal: true
+    on_multi_click:
+      - timing:
+          - ON for at least 1s
+        then:
+          - light.toggle: ulanzi_leds
+      - timing:
+          - ON for at most 0.8s
+          - OFF for at least 0.1s
+        then:
+          - lambda: |-
+              id(auto_rotate) = !id(auto_rotate);
+
+  - platform: gpio
+    pin:
+      number: GPIO14
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Taste Rechts"
+    internal: true
+    on_press:
+      then:
+        - lambda: |-
+            id(auto_rotate) = false;
+            int start = id(display_mode);
+            int new_mode = start;
+            do {
+              new_mode = (new_mode + 1) % 5;
+            } while (new_mode != start && new_mode == 4 && !id(show_clock));
+            id(display_mode) = new_mode;
+        - component.update: ulanzi_matrix
+
+interval:
+  # Fronius-Poll mit einstellbarem Intervall: Der Zaehler
+  # inkrementiert sekündlich, abgefragt wird, sobald der im
+  # Web-GUI eingestellte Wert erreicht ist (mindestens 3 s).
+  - interval: 1s
+    then:
+      - lambda: 'id(poll_counter) += 1;'
+      - if:
+          condition:
+            and:
+              - wifi.connected:
+              - lambda: |-
+                  int iv = (int) id(poll_interval_number).state;
+                  if (iv < 3) iv = 3;
+                  return id(poll_counter) >= iv;
+          then:
+            - lambda: 'id(poll_counter) = 0;'
+            - http_request.get:
+                # es wird immer die AKTIVE IP abgefragt (Standard-IP aus dem
+                # Web-GUI-Feld, im Fehlerfall automatisch auf die Fallback-IP)
+                url: !lambda |-
+                  return "http://" + id(fronius_active_ip) + "/solar_api/v1/GetPowerFlowRealtimeData.fcgi";
+                capture_response: true
+                max_response_buffer_size: 2048
+                on_response:
+                  then:
+                    - lambda: |-
+                        if (response->status_code == 200) {
+                          ArduinoJson::JsonDocument doc;
+                          ArduinoJson::DeserializationError err = ArduinoJson::deserializeJson(doc, body);
+                          if (err == ArduinoJson::DeserializationError::Ok) {
+                            ArduinoJson::JsonObject site = doc["Body"]["Data"]["Site"];
+                            if (!site["P_Grid"].isNull()) {
+                              id(grid_power) = site["P_Grid"].as<float>();
+                              id(load_power) = site["P_Load"].as<float>();
+                              id(pv_power) = site["P_PV"].as<float>();
+                              // Wechselrichter-Nr. aus dem Web-GUI-Regler
+                              float inv_raw = id(inverter_id_number).state;
+                              int inv_id = (inv_raw == inv_raw) ? (int) round(inv_raw) : 1;
+                              char inv_key[4];
+                              snprintf(inv_key, sizeof(inv_key), "%d", inv_id);
+                              ArduinoJson::JsonObject inv1 = doc["Body"]["Data"]["Inverters"][inv_key];
+                              if (!inv1["SOC"].isNull()) id(battery_soc) = inv1["SOC"].as<float>();
+                              id(data_valid) = true;
+                              id(failed_attempts) = 0;
+                            } else {
+                              id(failed_attempts) += 1;
+                              if (id(failed_attempts) >= 3) id(data_valid) = false;
+                            }
+                          } else {
+                            id(failed_attempts) += 1;
+                            if (id(failed_attempts) >= 3) id(data_valid) = false;
+                          }
+                        } else {
+                          id(failed_attempts) += 1;
+                          if (id(failed_attempts) >= 3) id(data_valid) = false;
+                        }
+                on_error:
+                  then:
+                    - lambda: |-
+                        id(failed_attempts) += 1;
+                        if (id(failed_attempts) >= 3) id(data_valid) = false;
+                        // Verbindungsfehler = nicht erreichbar -> IP wechseln:
+                        // aktiv war Standard -> auf Browser-Fallback umschalten,
+                        // aktiv war Fallback -> zurueck auf die Standard-IP.
+                        std::string std_ip = id(fronius_std_text).state.empty()
+                                             ? "${fronius_ip}" : id(fronius_std_text).state;
+                        if (id(fronius_active_ip) == std_ip) {
+                          if (!id(fronius_ip_text).state.empty())
+                            id(fronius_active_ip) = id(fronius_ip_text).state;
+                        } else {
+                          id(fronius_active_ip) = std_ip;
+                        }
+
+  # IP-Laufschrift automatisch starten, sobald WLAN verbunden ist
+  # (einmal pro Boot). Prueft aktiv den Zustand des IP-Textsensors.
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - lambda: |-
+                if (id(ip_shown)) return;
+                if (id(wifi_ip_sensor).has_state() && !id(wifi_ip_sensor).state.empty())
+                  id(ip_show_switch).turn_on();
+
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto idx = id(mode_select).active_index();
+          if (!idx.has_value() || (int) idx.value() != id(display_mode)) {
+            id(mode_select).publish_state((size_t) id(display_mode));
+          }
+
+          auto fidx = id(font_select).active_index();
+          if (!fidx.has_value() || (int) fidx.value() != id(font_style)) {
+            id(font_select).publish_state((size_t) id(font_style));
+          }
+
+          if (id(auto_rotate)) {
+            id(rotate_counter) += 1;
+            if (id(rotate_counter) >= (int) id(rotate_interval_number).state) {
+              id(rotate_counter) = 0;
+              int new_mode = id(display_mode);
+              for (int i = 0; i < 4; i++) {
+                new_mode = (new_mode + 1) % 5;
+                bool relevant =
+                  (new_mode == 0) ||
+                  (new_mode == 1) ||
+                  (new_mode == 2 && (id(my_sun).is_above_horizon() || id(pv_power) > 10.0f)) ||
+                  (new_mode == 3) ||
+                  (new_mode == 4 && id(show_clock) && id(sntp_time).now().is_valid());
+                if (relevant) break;
+              }
+              id(display_mode) = new_mode;
+            }
+          }
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: ulanzi_leds
+    channel_colors: GRB
+    pin: GPIO32
+    num_leds: 256
+    chipset: WS2812
+    name: "Display Helligkeit"
+    default_transition_length: 0s
+    restore_mode: ALWAYS_ON
+    internal: true
+
+display:
+  - platform: addressable_light
+    id: ulanzi_matrix
+    addressable_light_id: ulanzi_leds
+    width: 32
+    height: 8
+    update_interval: 250ms   # fuer fluessige Laufschrift
+    pixel_mapper: |-
+      if (y % 2 == 0) {
+        return (y * 32) + x;
+      }
+      return (y * 32) + (31 - x);
+    lambda: |-
+      float br = id(auto_brightness) ? id(brightness_level) : id(manual_brightness_number).state;
+      if (br < 0.05f) br = 0.05f;
+      if (br > 1.0f) br = 1.0f;
+
+      Color red = Color(200 * br, 0, 0);
+      Color green = Color(0, 180 * br, 0);
+      Color cyan = Color(0, 160 * br, 200 * br);
+      Color yellow = Color(255 * br, 255 * br, 0);
+      Color gray = Color(120 * br, 120 * br, 120 * br);
+      Color white = Color(150 * br, 150 * br, 150 * br);
+
+      int ty = (int) (id(text_y_number).state + 0.5f);
+
+      // IP-Laufschrift nach erster WLAN-Verbindung (einmal, ~20 s)
+      if (id(ip_shown) && id(ip_show_ms) > 0) {
+        uint32_t elapsed = millis() - id(ip_show_start);
+        if (elapsed < (uint32_t) id(ip_show_ms)) {
+          int steps = (int) (elapsed / (uint32_t) id(ip_step_ms));
+          int sx = 32 - steps;
+          it.print(sx, ty, id(pixel_font), white, TextAlign::CENTER_LEFT, id(ip_text).c_str());
+          return;
+        }
+      }
+
+      char buf[16];
+      Color col = white;
+
+      if (!id(data_valid)) {
+        if (id(failed_attempts) >= 3) {
+          snprintf(buf, sizeof(buf), "OFF");
+          col = red;
+        } else {
+          snprintf(buf, sizeof(buf), "WAIT");
+          col = yellow;
+        }
+      }
+      else if (id(display_mode) == 0) {
+        float power = id(grid_power);
+        if (fabs(power) >= 1000.0f)
+          snprintf(buf, sizeof(buf), "%.1fkW", fabs(power) / 1000.0f);
+        else
+          snprintf(buf, sizeof(buf), "%dW", (int) round(fabs(power)));
+        if (power > 0) col = red;
+        else if (power < 0) col = green;
+      }
+      else if (id(display_mode) == 1) {
+        float load = fabs(id(load_power));
+        if (load >= 1000.0f)
+          snprintf(buf, sizeof(buf), "%.1fkW", load / 1000.0f);
+        else
+          snprintf(buf, sizeof(buf), "%dW", (int) round(load));
+        col = cyan;
+      }
+      else if (id(display_mode) == 2) {
+        float pv = id(pv_power);
+        if (fabs(pv) >= 1000.0f)
+          snprintf(buf, sizeof(buf), "%.1fkW", pv / 1000.0f);
+        else
+          snprintf(buf, sizeof(buf), "%dW", (int) round(pv));
+        col = yellow;
+      }
+      else if (id(display_mode) == 3) {
+        int soc = round(id(battery_soc));
+        snprintf(buf, sizeof(buf), "%d%%", soc);
+        col = gray;
+      }
+      else if (id(display_mode) == 4) {
+        auto now = id(sntp_time).now();
+        if (now.is_valid()) {
+          now.strftime(buf, sizeof(buf), "%H:%M");
+          col = white;
+        } else {
+          snprintf(buf, sizeof(buf), "--:--");
+          col = gray;
+        }
+      }
+
+      // --- Zeichnen je nach Schriftstil ---
+      if (id(font_style) == 1 || id(font_style) == 3) {
+        // MATRIX-FONTS: handgezeichnet, 5 Spalten breit.
+        // Stil 1 = 8 Reihen hoch (Bit 0..7), Stil 3 = 7 Reihen hoch (Bit 0..6).
+        bool tall = (id(font_style) == 1);
+        int hgt = tall ? 8 : 7;
+        // Beim 7-zeiligen Font: Y-Regler entscheidet, wo die freie Reihe sitzt
+        int yv = tall ? 0 : ((ty > 4) ? 1 : 0);
+
+        // --- Tabelle 8 hoch (Stil 1) ---
+        static const uint8_t G0[]  = {0x7E,0x81,0x81,0x81,0x7E};
+        static const uint8_t G1[]  = {0x00,0x82,0xFF,0x80,0x00};
+        static const uint8_t G2[]  = {0xC2,0xA3,0x91,0x89,0xC6};
+        static const uint8_t G3[]  = {0x42,0x81,0x89,0x89,0x76};
+        static const uint8_t G4[]  = {0x1C,0x12,0x11,0xFF,0x10};
+        static const uint8_t G5[]  = {0x4F,0x89,0x89,0x89,0x71};
+        static const uint8_t G6[]  = {0x7E,0x89,0x89,0x89,0x72};
+        static const uint8_t G7[]  = {0x81,0x61,0x19,0x05,0x03};
+        static const uint8_t G8[]  = {0x76,0x89,0x89,0x89,0x76};
+        static const uint8_t G9[]  = {0x4E,0x91,0x91,0x91,0x7E};
+        static const uint8_t GCO[] = {0x00,0x66,0x66,0x00,0x00};
+        static const uint8_t GDT[] = {0x00,0xC0,0xC0,0x00,0x00};
+        static const uint8_t GMI[] = {0x00,0x18,0x18,0x18,0x00};
+        static const uint8_t GPC[] = {0x43,0x23,0x10,0xC8,0xC4};
+        static const uint8_t GKL[] = {0xFF,0x10,0x30,0x48,0xC4};
+        static const uint8_t GWA[] = {0x3F,0xC0,0x38,0xC0,0x3F};
+        static const uint8_t GAB[] = {0xFE,0x09,0x09,0x09,0xFE};
+        static const uint8_t GFA[] = {0xFF,0x09,0x09,0x09,0x01};
+        static const uint8_t GIB[] = {0x81,0x81,0xFF,0x81,0x81};
+        static const uint8_t GOB[] = {0x7E,0x81,0x81,0x81,0x7E};
+        static const uint8_t GTB[] = {0x01,0x01,0xFF,0x01,0x01};
+
+        // --- Tabelle 7 hoch (Stil 3) ---
+        static const uint8_t H0[]  = {0x3E,0x41,0x41,0x41,0x3E};
+        static const uint8_t H1[]  = {0x00,0x42,0x7F,0x40,0x00};
+        static const uint8_t H2[]  = {0x42,0x61,0x51,0x49,0x46};
+        static const uint8_t H3[]  = {0x21,0x41,0x45,0x4B,0x31};
+        static const uint8_t H4[]  = {0x18,0x14,0x12,0x7F,0x10};
+        static const uint8_t H5[]  = {0x27,0x45,0x45,0x45,0x39};
+        static const uint8_t H6[]  = {0x3E,0x49,0x49,0x49,0x32};
+        static const uint8_t H7[]  = {0x01,0x71,0x09,0x05,0x03};
+        static const uint8_t H8[]  = {0x36,0x49,0x49,0x49,0x36};
+        static const uint8_t H9[]  = {0x26,0x49,0x49,0x49,0x3E};
+        static const uint8_t HCO[] = {0x00,0x6C,0x6C,0x00,0x00};
+        static const uint8_t HDT[] = {0x00,0x60,0x60,0x00,0x00};
+        static const uint8_t HMI[] = {0x00,0x08,0x08,0x08,0x00};
+        static const uint8_t HPC[] = {0x43,0x23,0x10,0x68,0x64};
+        static const uint8_t HKL[] = {0x7F,0x10,0x30,0x48,0x04};
+        static const uint8_t HWA[] = {0x3F,0x40,0x38,0x40,0x3F};
+        static const uint8_t HAB[] = {0x7E,0x11,0x11,0x11,0x7E};
+        static const uint8_t HFA[] = {0x7F,0x09,0x09,0x09,0x01};
+        static const uint8_t HIB[] = {0x00,0x41,0x7F,0x41,0x00};
+        static const uint8_t HOB[] = {0x3E,0x41,0x41,0x41,0x3E};
+        static const uint8_t HTB[] = {0x01,0x01,0x7F,0x01,0x01};
+
+        int n = 0;
+        for (const char* p = buf; *p; ++p) n++;
+        int adv = 6;
+        if (n * 6 - 1 > 32) adv = 5;
+        int w = n * adv - 1;
+        int x = (32 - w) / 2;
+        if (x < 0) x = 0;
+
+        for (const char* p = buf; *p; ++p) {
+          const uint8_t* g = nullptr;
+          switch (*p) {
+            case '0': g = tall ? G0  : H0;  break;
+            case '1': g = tall ? G1  : H1;  break;
+            case '2': g = tall ? G2  : H2;  break;
+            case '3': g = tall ? G3  : H3;  break;
+            case '4': g = tall ? G4  : H4;  break;
+            case '5': g = tall ? G5  : H5;  break;
+            case '6': g = tall ? G6  : H6;  break;
+            case '7': g = tall ? G7  : H7;  break;
+            case '8': g = tall ? G8  : H8;  break;
+            case '9': g = tall ? G9  : H9;  break;
+            case ':': g = tall ? GCO : HCO; break;
+            case '.': g = tall ? GDT : HDT; break;
+            case '-': g = tall ? GMI : HMI; break;
+            case '%': g = tall ? GPC : HPC; break;
+            case 'k': g = tall ? GKL : HKL; break;
+            case 'W': g = tall ? GWA : HWA; break;
+            case 'A': g = tall ? GAB : HAB; break;
+            case 'F': g = tall ? GFA : HFA; break;
+            case 'I': g = tall ? GIB : HIB; break;
+            case 'O': g = tall ? GOB : HOB; break;
+            case 'T': g = tall ? GTB : HTB; break;
+            default: break;
+          }
+          if (g != nullptr) {
+            for (int cx = 0; cx < 5; cx++) {
+              for (int cy = 0; cy < hgt; cy++) {
+                if (g[cx] & (1u << cy))
+                  it.filled_rectangle(x + cx, yv + cy, 1, 1, col);
+              }
+            }
+          }
+          x += adv;
+        }
+      }
+      else {
+        auto* fnt = id(pixel_font);
+        if (id(font_style) == 2) fnt = id(pixel_font_rm11);
+        it.print(16, ty, fnt, col, TextAlign::CENTER, buf);
+      }
