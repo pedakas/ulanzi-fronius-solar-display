@@ -444,4 +444,4 @@ Server kontaktiert und keine Nutzungsstatistiken erhoben.
 
 ## Lizenz
 
-MIT – © 2026 Peter Kadoun
+MIT 
